@@ -33,7 +33,7 @@ const GLASS: React.CSSProperties = {
   WebkitBackdropFilter: 'blur(16px)',
 };
 
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 
 const BTN_SIZE = 28;
 const INSET = 6;
@@ -67,9 +67,44 @@ class CachingStore {
   private order: string[] = [];
   private bytes = 0;
   private prefetchController: AbortController | null = null;
+  /** Timestamp of the most recent getItem call (hit or miss). */
+  private lastGetItemTime = 0;
+  /** Count of in-flight fetches (cache misses, any caller). */
+  private pendingFetches = 0;
+  private settledResolvers: (() => void)[] = [];
   constructor(private inner: any, private maxBytes = 256 * 1024 * 1024) {}
 
+  /** Resolves once no getItem calls have occurred for `quietMs`,
+   *  then waits for any remaining in-flight fetches to complete.
+   *  During playback prefetch is suppressed, so only display requests
+   *  flow through — making this an accurate measure of tile loading.
+   *  Safety timeout at `timeoutMs` to prevent infinite hangs. */
+  waitForIdle(quietMs: number, timeoutMs = 10000): Promise<void> {
+    // Reset so we always observe at least one full quiet period.
+    this.lastGetItemTime = performance.now();
+    return new Promise(resolve => {
+      const deadline = performance.now() + timeoutMs;
+      const check = () => {
+        const since = performance.now() - this.lastGetItemTime;
+        if (since >= quietMs) {
+          // Quiet period elapsed — if fetches still in flight, wait for them
+          if (this.pendingFetches > 0) {
+            this.settledResolvers.push(resolve);
+          } else {
+            resolve();
+          }
+          return;
+        }
+        if (performance.now() >= deadline) { resolve(); return; }
+        setTimeout(check, Math.max(1, quietMs - since));
+      };
+      setTimeout(check, quietMs);
+    });
+  }
+
   async getItem(item: string, opts?: any): Promise<ArrayBuffer> {
+    this.lastGetItemTime = performance.now();
+
     const hit = this.cache.get(item);
     if (hit) {
       // Move to end (most-recently-used)
@@ -77,16 +112,25 @@ class CachingStore {
       if (i >= 0) { this.order.splice(i, 1); this.order.push(item); }
       return hit;
     }
-    const buf: ArrayBuffer = await this.inner.getItem(item, opts);
-    this.cache.set(item, buf);
-    this.order.push(item);
-    this.bytes += buf.byteLength;
-    while (this.bytes > this.maxBytes && this.order.length > 0) {
-      const old = this.order.shift()!;
-      const b = this.cache.get(old);
-      if (b) { this.bytes -= b.byteLength; this.cache.delete(old); }
+    this.pendingFetches++;
+    try {
+      const buf: ArrayBuffer = await this.inner.getItem(item, opts);
+      this.cache.set(item, buf);
+      this.order.push(item);
+      this.bytes += buf.byteLength;
+      while (this.bytes > this.maxBytes && this.order.length > 0) {
+        const old = this.order.shift()!;
+        const b = this.cache.get(old);
+        if (b) { this.bytes -= b.byteLength; this.cache.delete(old); }
+      }
+      return buf;
+    } finally {
+      this.pendingFetches--;
+      if (this.pendingFetches === 0) {
+        const cbs = this.settledResolvers.splice(0);
+        cbs.forEach(cb => cb());
+      }
     }
-    return buf;
   }
 
   /** Cancel all in-flight prefetch requests so display requests get priority. */
@@ -1957,12 +2001,16 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   const containerSize = useContainerSize(containerRef);
   const [viewState, setViewState] = useState<any>(null);
   const [fitView, setFitView] = useState<SavedView | null>(null);
+  const initialViewAppliedRef = useRef(false);
   const { navigateTo, cancelAnimation } = useAnimatedNavigation(viewState, setViewState, onViewStateChange);
   const onViewStateChangeRef = useRef(onViewStateChange);
   onViewStateChangeRef.current = onViewStateChange;
   const cancelAnimationRef = useRef(cancelAnimation);
   cancelAnimationRef.current = cancelAnimation;
   const handleDeckViewStateChange = useCallback((e: any) => {
+    // Ignore DeckGL's initial uncontrolled viewState callback — the initial
+    // view effect will set the correct viewState (including any default view).
+    if (!initialViewAppliedRef.current) return;
     cancelAnimationRef.current();
     setViewState(e.viewState);
     onViewStateChangeRef.current?.(e.viewState);
@@ -2035,6 +2083,7 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
     setError(null);
     setLoaded(null);
     setViewState(null);
+    initialViewAppliedRef.current = false;
 
     Promise.all([
       import('@hms-dbmi/viv'),
@@ -2107,7 +2156,7 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   // Initial view state — wait for non-zero deck dimensions, then either apply
   // the single default view or fit to the full image.
   useEffect(() => {
-    if (!loaded || viewState) return;
+    if (!loaded) return;
     let cancelled = false;
     const check = () => {
       if (cancelled) return;
@@ -2135,6 +2184,8 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
             setViewState(fitVs);
             onViewStateChangeRef.current?.(fitVs);
           }
+          // Allow DeckGL onViewStateChange callbacks now that the initial view is set
+          initialViewAppliedRef.current = true;
         } else {
           requestAnimationFrame(check);
         }
@@ -2169,9 +2220,10 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
     return () => { cancelled = true; };
   }, [loaded, currentZ, currentT]);
 
-  // Prefetch adjacent Z/T slices in the background after the current slice loads
+  // Prefetch adjacent Z/T slices in the background after the current slice loads.
+  // Skipped during playback — the playback loop itself ensures each slice loads.
   useEffect(() => {
-    if (!loaded || !cachingStoreRef.current) return;
+    if (!loaded || !cachingStoreRef.current || tPlaying) return;
     const { dimLabels, numZ, numT, data } = loaded;
     const zIdx = dimLabels.indexOf('z');
     const tIdx = dimLabels.indexOf('t');
@@ -2197,17 +2249,44 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
       });
     }, 100);
     return () => { clearTimeout(handle); store.cancelPrefetch(); };
-  }, [loaded, currentZ, currentT]);
+  }, [loaded, currentZ, currentT, tPlaying]);
 
-  // T playback interval — lives at Viewer level so playback works even when
-  // the T panel is closed (e.g. when triggered by a preset view)
+  // T playback — async loop that waits for each frame's tiles to load before
+  // advancing, so FPS is a target rather than a mandate.  First pass through
+  // uncached slices may be slower; subsequent loops play at full speed.
   useEffect(() => {
     if (!tPlaying || !loaded || loaded.numT <= 1) return;
     const numT = loaded.numT;
-    const interval = setInterval(() => {
-      setCurrentT(prev => (prev + 1) % numT);
-    }, 1000 / tFps);
-    return () => clearInterval(interval);
+    const store = cachingStoreRef.current;
+    let cancelled = false;
+
+    const playLoop = async () => {
+      while (!cancelled) {
+        const frameStart = performance.now();
+
+        // Advance to next T slice
+        setCurrentT(prev => (prev + 1) % numT);
+
+        if (store) {
+          // Wait until tile loading settles: no new getItem calls for 50ms,
+          // then wait for any in-flight network fetches to complete.
+          // First pass (uncached): slower, limited by network.
+          // Subsequent passes (cached): ~50ms overhead per frame.
+          await store.waitForIdle(50);
+          if (cancelled) return;
+        }
+
+        // Maintain target fps: wait any remaining interval time
+        const elapsed = performance.now() - frameStart;
+        const remaining = Math.max(0, (1000 / tFps) - elapsed);
+        if (remaining > 0) {
+          await new Promise<void>(r => setTimeout(r, remaining));
+        }
+      }
+    };
+
+    playLoop();
+    return () => { cancelled = true; };
   }, [tPlaying, tFps, loaded]);
 
   const handleToggleChannel = useCallback((index: number) => {
