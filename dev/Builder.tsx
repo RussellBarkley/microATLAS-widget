@@ -400,6 +400,57 @@ function NumberInput({ value, onChange, error, t }: {
   );
 }
 
+function EditableTag({ value, onChange, min, max, prefix, suffix, t }: {
+  value: number;
+  onChange: (v: number) => void;
+  min?: number;
+  max?: number;
+  prefix?: string;
+  suffix?: string;
+  t: Theme;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [raw, setRaw] = useState(String(value));
+
+  if (editing) {
+    return (
+      <input
+        type="number"
+        autoFocus
+        value={raw}
+        min={min}
+        max={max}
+        onChange={(e) => setRaw(e.target.value)}
+        onBlur={() => {
+          const n = parseInt(raw);
+          if (!isNaN(n)) onChange(Math.max(min ?? -Infinity, Math.min(max ?? Infinity, n)));
+          setEditing(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+          if (e.key === 'Escape') setEditing(false);
+        }}
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: 32, background: t.surface2, border: `1px solid ${t.accent40}`,
+          borderRadius: 3, padding: '0 2px', fontSize: 9, color: t.text1,
+          textAlign: 'center', outline: 'none', marginLeft: 2,
+        }}
+      />
+    );
+  }
+
+  return (
+    <span
+      onClick={(e) => { e.stopPropagation(); setRaw(String(value)); setEditing(true); }}
+      title="Click to edit"
+      style={{ cursor: 'pointer', borderBottom: `1px dashed ${t.text3}`, marginLeft: 3 }}
+    >
+      {prefix}{value}{suffix}
+    </span>
+  );
+}
+
 function ListItem({ children, onDelete, t }: { children: React.ReactNode; onDelete: () => void; t: Theme }) {
   return (
     <div style={{
@@ -522,15 +573,26 @@ export function Builder() {
     appearanceRef.current = a;
   }, []);
 
+  const sliceRef = useRef<{ z: number; t: number; playing: boolean; fps: number; numZ: number; numT: number } | null>(null);
+  const handleSliceChange = useCallback((s: { z: number; t: number; playing: boolean; fps: number; numZ: number; numT: number }) => {
+    sliceRef.current = s;
+  }, []);
+
   const [captureFormOpen, setCaptureFormOpen] = useState(false);
   const [captureName, setCaptureName] = useState('');
   const [captureDesc, setCaptureDesc] = useState('');
   const [captureAppearance, setCaptureAppearance] = useState(true);
+  const [captureSlice, setCaptureSlice] = useState(true);
+  const [capturePlayback, setCapturePlayback] = useState(false);
+  const [captureFps, setCaptureFps] = useState(5);
+  const [captureStartFrame, setCaptureStartFrame] = useState(0);
 
   const [annotationFormOpen, setAnnotationFormOpen] = useState(false);
   const [annotationName, setAnnotationName] = useState('');
   const [annotationColor, setAnnotationColor] = useState<[number, number, number]>(COLOR_SWATCHES[0]);
   const [annotationMode, setAnnotationMode] = useState(false);
+  const [annotationLockZ, setAnnotationLockZ] = useState(true);
+  const [annotationLockT, setAnnotationLockT] = useState(true);
 
   const [copied, setCopied] = useState(false);
   const viewerContainerRef = useRef<HTMLDivElement>(null);
@@ -581,13 +643,18 @@ export function Builder() {
   const handleCaptureView = () => {
     const vs = viewStateRef.current;
     if (!vs || !captureName.trim()) return;
-    setViews((prev) => [...prev, {
+    const sl = sliceRef.current;
+    const view: SavedView = {
       name: captureName.trim(),
       ...(captureDesc.trim() ? { description: captureDesc.trim() } : {}),
       zoom: Math.round(vs.zoom * 1000) / 1000,
       target: [Math.round(vs.target[0]), Math.round(vs.target[1]), 0],
       ...(captureAppearance && appearanceRef.current ? { appearance: appearanceRef.current } : {}),
-    }]);
+      ...(captureSlice && sl && sl.numZ > 1 ? { z: sl.z } : {}),
+      ...(captureSlice && sl && sl.numT > 1 ? { t: sl.t } : {}),
+      ...(capturePlayback && sl && sl.numT > 1 ? { playback: { playing: sl.playing, fps: captureFps, startFrame: captureStartFrame } } : {}),
+    };
+    setViews((prev) => [...prev, view]);
     setCaptureName('');
     setCaptureDesc('');
     setCaptureFormOpen(false);
@@ -605,11 +672,19 @@ export function Builder() {
     const scale = Math.pow(2, vs.zoom);
     const imageX = Math.round((e.clientX - rect.left - rect.width / 2) / scale + vs.target[0]);
     const imageY = Math.round((e.clientY - rect.top - rect.height / 2) / scale + vs.target[1]);
-    setAnnotations((prev) => [...prev, { name: annotationName.trim(), target: [imageX, imageY], color: annotationColor }]);
+    const sl = sliceRef.current;
+    const annotation: Annotation = {
+      name: annotationName.trim(),
+      target: [imageX, imageY],
+      color: annotationColor,
+      ...(annotationLockZ && sl && sl.numZ > 1 ? { z: sl.z } : {}),
+      ...(annotationLockT && sl && sl.numT > 1 ? { t: sl.t } : {}),
+    };
+    setAnnotations((prev) => [...prev, annotation]);
     setAnnotationMode(false);
     setAnnotationName('');
     setAnnotationFormOpen(false);
-  }, [annotationMode, annotationName, annotationColor]);
+  }, [annotationMode, annotationName, annotationColor, annotationLockZ, annotationLockT]);
 
   const handleCopy = async () => {
     try {
@@ -774,6 +849,7 @@ export function Builder() {
                     defaultTitleVisible={defaultTitleVisible}
                     onViewStateChange={handleViewStateChange}
                     onAppearanceChange={handleAppearanceChange}
+                    onSliceChange={handleSliceChange}
                   />
                 )}
                 {annotationMode && (
@@ -889,6 +965,37 @@ export function Builder() {
                       {v.appearance && (
                         <span style={{ fontSize: 9, color: t.text3, marginLeft: 6, fontWeight: 400 }}>+ appearance</span>
                       )}
+                      {v.z !== undefined && (
+                        <span style={{ fontSize: 9, color: t.text3, marginLeft: 6, fontWeight: 400 }}>Z:{v.z}</span>
+                      )}
+                      {v.t !== undefined && (
+                        <span style={{ fontSize: 9, color: t.text3, marginLeft: 6, fontWeight: 400 }}>T:{v.t}</span>
+                      )}
+                      {v.playback && (
+                        <span style={{ fontSize: 9, color: t.text3, marginLeft: 6, fontWeight: 400 }}>
+                          {v.playback.playing ? '▶' : '⏸'}
+                          {v.playback.fps !== undefined && (
+                            <EditableTag
+                              value={v.playback.fps}
+                              suffix="fps"
+                              min={1}
+                              max={60}
+                              onChange={(val) => setViews((p) => p.map((vw, j) => j === i ? { ...vw, playback: { ...vw.playback!, fps: val } } : vw))}
+                              t={t}
+                            />
+                          )}
+                          {v.playback.startFrame !== undefined && (
+                            <EditableTag
+                              value={v.playback.startFrame}
+                              prefix="@"
+                              min={0}
+                              max={sliceRef.current ? sliceRef.current.numT - 1 : 999}
+                              onChange={(val) => setViews((p) => p.map((vw, j) => j === i ? { ...vw, playback: { ...vw.playback!, startFrame: val } } : vw))}
+                              t={t}
+                            />
+                          )}
+                        </span>
+                      )}
                     </div>
                     {v.description && (
                       <div style={{ fontSize: 10, color: t.text3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 }}>{v.description}</div>
@@ -904,7 +1011,7 @@ export function Builder() {
                   <div style={{ marginBottom: 8 }}>
                     <TextInput value={captureDesc} onChange={setCaptureDesc} onEnter={handleCaptureView} placeholder="Description (optional)" t={t} />
                   </div>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer', fontSize: 12, color: t.text2 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, cursor: 'pointer', fontSize: 12, color: t.text2 }}>
                     <input
                       type="checkbox"
                       checked={captureAppearance}
@@ -913,6 +1020,74 @@ export function Builder() {
                     />
                     Save appearance
                   </label>
+                  {sliceRef.current && (sliceRef.current.numZ > 1 || sliceRef.current.numT > 1) && (
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, cursor: 'pointer', fontSize: 12, color: t.text2 }}>
+                      <input
+                        type="checkbox"
+                        checked={captureSlice}
+                        onChange={(e) => setCaptureSlice(e.target.checked)}
+                        style={{ accentColor: t.accent }}
+                      />
+                      Save Z/T position
+                      <span style={{ fontSize: 10, color: t.text3 }}>
+                        {sliceRef.current.numZ > 1 ? `Z:${sliceRef.current.z + 1}` : ''}{sliceRef.current.numZ > 1 && sliceRef.current.numT > 1 ? ' ' : ''}{sliceRef.current.numT > 1 ? `T:${sliceRef.current.t + 1}` : ''}
+                      </span>
+                    </label>
+                  )}
+                  {sliceRef.current && sliceRef.current.numT > 1 && (
+                    <>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: capturePlayback ? 6 : 4, cursor: 'pointer', fontSize: 12, color: t.text2 }}>
+                        <input
+                          type="checkbox"
+                          checked={capturePlayback}
+                          onChange={(e) => {
+                            setCapturePlayback(e.target.checked);
+                            if (e.target.checked && sliceRef.current) {
+                              setCaptureFps(sliceRef.current.fps);
+                              setCaptureStartFrame(sliceRef.current.t);
+                            }
+                          }}
+                          style={{ accentColor: t.accent }}
+                        />
+                        Save playback state
+                      </label>
+                      {capturePlayback && (
+                        <div style={{ display: 'flex', gap: 10, marginBottom: 6, marginLeft: 26, alignItems: 'center' }}>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: t.text3 }}>
+                            FPS
+                            <input
+                              type="number"
+                              min={1}
+                              max={60}
+                              value={captureFps}
+                              onChange={(e) => setCaptureFps(Math.max(1, Math.min(60, parseInt(e.target.value) || 1)))}
+                              style={{
+                                width: 42, background: t.surface2, border: `1px solid ${t.border}`,
+                                borderRadius: 4, padding: '2px 4px', fontSize: 11, color: t.text1,
+                                textAlign: 'center', outline: 'none',
+                              }}
+                            />
+                          </label>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: t.text3 }}>
+                            Start
+                            <input
+                              type="number"
+                              min={0}
+                              max={sliceRef.current!.numT - 1}
+                              value={captureStartFrame}
+                              onChange={(e) => setCaptureStartFrame(Math.max(0, Math.min(sliceRef.current!.numT - 1, parseInt(e.target.value) || 0)))}
+                              style={{
+                                width: 42, background: t.surface2, border: `1px solid ${t.border}`,
+                                borderRadius: 4, padding: '2px 4px', fontSize: 11, color: t.text1,
+                                textAlign: 'center', outline: 'none',
+                              }}
+                            />
+                            <span style={{ fontSize: 10, color: t.text3 }}>/ {sliceRef.current!.numT}</span>
+                          </label>
+                        </div>
+                      )}
+                    </>
+                  )}
                   <div style={{ display: 'flex', gap: 6 }}>
                     <ActionButton onClick={handleCaptureView} disabled={!captureName.trim() || !hasViewState} t={t}>Save</ActionButton>
                     <ActionButton onClick={() => { setCaptureFormOpen(false); setCaptureName(''); setCaptureDesc(''); }} variant="ghost" t={t}>Cancel</ActionButton>
@@ -939,6 +1114,30 @@ export function Builder() {
                   }} />
                   <span style={{ fontSize: 12, fontWeight: 500, color: t.text1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {a.name}
+                    {a.z !== undefined ? (
+                      <EditableTag
+                        value={a.z}
+                        prefix="Z:"
+                        min={0}
+                        max={sliceRef.current ? sliceRef.current.numZ - 1 : 999}
+                        onChange={(val) => setAnnotations((p) => p.map((ann, j) => j === i ? { ...ann, z: val } : ann))}
+                        t={t}
+                      />
+                    ) : sliceRef.current && sliceRef.current.numZ > 1 ? (
+                      <span style={{ fontSize: 9, color: t.text3, marginLeft: 6, fontWeight: 400 }}>All Z</span>
+                    ) : null}
+                    {a.t !== undefined ? (
+                      <EditableTag
+                        value={a.t}
+                        prefix="T:"
+                        min={0}
+                        max={sliceRef.current ? sliceRef.current.numT - 1 : 999}
+                        onChange={(val) => setAnnotations((p) => p.map((ann, j) => j === i ? { ...ann, t: val } : ann))}
+                        t={t}
+                      />
+                    ) : sliceRef.current && sliceRef.current.numT > 1 ? (
+                      <span style={{ fontSize: 9, color: t.text3, marginLeft: 6, fontWeight: 400 }}>All T</span>
+                    ) : null}
                   </span>
                 </ListItem>
               ))}
@@ -968,6 +1167,34 @@ export function Builder() {
                       );
                     })}
                   </div>
+                  {sliceRef.current && sliceRef.current.numZ > 1 && (
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, cursor: 'pointer', fontSize: 12, color: t.text2 }}>
+                      <input
+                        type="checkbox"
+                        checked={annotationLockZ}
+                        onChange={(e) => setAnnotationLockZ(e.target.checked)}
+                        style={{ accentColor: t.accent }}
+                      />
+                      Lock to Z slice
+                      <span style={{ fontSize: 10, color: t.text3 }}>
+                        {annotationLockZ ? `Z:${sliceRef.current.z + 1}` : 'All'}
+                      </span>
+                    </label>
+                  )}
+                  {sliceRef.current && sliceRef.current.numT > 1 && (
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, cursor: 'pointer', fontSize: 12, color: t.text2 }}>
+                      <input
+                        type="checkbox"
+                        checked={annotationLockT}
+                        onChange={(e) => setAnnotationLockT(e.target.checked)}
+                        style={{ accentColor: t.accent }}
+                      />
+                      Lock to T slice
+                      <span style={{ fontSize: 10, color: t.text3 }}>
+                        {annotationLockT ? `T:${sliceRef.current.t + 1}` : 'All'}
+                      </span>
+                    </label>
+                  )}
                   <div style={{ display: 'flex', gap: 6 }}>
                     <ActionButton onClick={handleStartAnnotationPlace} disabled={!annotationName.trim() || !hasViewState} t={t}>
                       <CrosshairIcon /> Place on Image

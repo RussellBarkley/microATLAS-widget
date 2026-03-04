@@ -33,6 +33,8 @@ const GLASS: React.CSSProperties = {
   WebkitBackdropFilter: 'blur(16px)',
 };
 
+const VERSION = '1.4.1';
+
 const BTN_SIZE = 28;
 const INSET = 6;
 const TRANSITION = 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)';
@@ -45,6 +47,150 @@ const PANEL_MARGIN = 20;
 
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
+}
+
+// Inject the spin keyframes once into the document
+const SPIN_KEYFRAMES_ID = 'microatlas-spin';
+function ensureSpinKeyframes() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById(SPIN_KEYFRAMES_ID)) return;
+  const style = document.createElement('style');
+  style.id = SPIN_KEYFRAMES_ID;
+  style.textContent = `@keyframes ${SPIN_KEYFRAMES_ID}{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`;
+  document.head.appendChild(style);
+}
+
+/** LRU in-memory cache wrapping a zarr HTTPStore. Keeps fetched chunks in a
+ *  Map so revisiting a Z/T slice is instant instead of re-fetching from S3. */
+class CachingStore {
+  private cache = new Map<string, ArrayBuffer>();
+  private order: string[] = [];
+  private bytes = 0;
+  private prefetchController: AbortController | null = null;
+  constructor(private inner: any, private maxBytes = 256 * 1024 * 1024) {}
+
+  async getItem(item: string, opts?: any): Promise<ArrayBuffer> {
+    const hit = this.cache.get(item);
+    if (hit) {
+      // Move to end (most-recently-used)
+      const i = this.order.indexOf(item);
+      if (i >= 0) { this.order.splice(i, 1); this.order.push(item); }
+      return hit;
+    }
+    const buf: ArrayBuffer = await this.inner.getItem(item, opts);
+    this.cache.set(item, buf);
+    this.order.push(item);
+    this.bytes += buf.byteLength;
+    while (this.bytes > this.maxBytes && this.order.length > 0) {
+      const old = this.order.shift()!;
+      const b = this.cache.get(old);
+      if (b) { this.bytes -= b.byteLength; this.cache.delete(old); }
+    }
+    return buf;
+  }
+
+  /** Cancel all in-flight prefetch requests so display requests get priority. */
+  cancelPrefetch() {
+    if (this.prefetchController) {
+      this.prefetchController.abort();
+      this.prefetchController = null;
+    }
+  }
+
+  /** Background-fetch chunks for adjacent Z/T slices so scrubbing feels instant.
+   *  Scans cached chunk paths matching the current position, swaps the Z or T
+   *  coordinate to nearby values, and fetches any that aren't already cached.
+   *  All prefetch requests are abortable via cancelPrefetch(). */
+  prefetchAdjacent(opts: {
+    zDimIdx: number; tDimIdx: number;
+    currentZ: number; currentT: number;
+    maxZ: number; maxT: number;
+    numDims: number; dimSep: string;
+    radius?: number;
+  }) {
+    this.cancelPrefetch();
+    const controller = new AbortController();
+    this.prefetchController = controller;
+
+    const { zDimIdx, tDimIdx, currentZ, currentT, maxZ, maxT, numDims, dimSep } = opts;
+    const radius = opts.radius ?? Math.max(maxZ, maxT);
+
+    // Parse every cached chunk path once, collect templates matching current pos
+    const templates: { prefix: string; coords: number[]; join: string }[] = [];
+    for (const path of this.cache.keys()) {
+      let prefix: string;
+      let coords: number[];
+
+      if (dimSep === '/') {
+        const parts = path.split('/');
+        if (parts.length < numDims + 1) continue;
+        const tail = parts.slice(-numDims);
+        if (!tail.every(s => /^\d+$/.test(s))) continue;
+        coords = tail.map(Number);
+        prefix = parts.slice(0, -numDims).join('/') + '/';
+      } else {
+        const slash = path.lastIndexOf('/');
+        if (slash < 0) continue;
+        prefix = path.substring(0, slash + 1);
+        const seg = path.substring(slash + 1);
+        if (!/^\d+(\.\d+)*$/.test(seg)) continue;
+        coords = seg.split('.').map(Number);
+      }
+
+      if (coords.length !== numDims) continue;
+      if (zDimIdx >= 0 && coords[zDimIdx] !== currentZ) continue;
+      if (tDimIdx >= 0 && coords[tDimIdx] !== currentT) continue;
+      templates.push({ prefix, coords, join: dimSep === '/' ? '/' : '.' });
+    }
+
+    // Generate paths nearest-first (d=1, d=-1, d=2, d=-2, …) and fetch in
+    // small batches so we yield to display requests between batches.
+    const batches: string[][] = [];
+    let batch: string[] = [];
+    for (let d = 1; d <= radius; d++) {
+      for (const sign of [1, -1]) {
+        const offset = d * sign;
+        for (const { prefix, coords, join } of templates) {
+          if (zDimIdx >= 0) {
+            const nz = currentZ + offset;
+            if (nz >= 0 && nz < maxZ) {
+              const c = [...coords]; c[zDimIdx] = nz;
+              const p = prefix + c.join(join);
+              if (!this.cache.has(p)) batch.push(p);
+            }
+          }
+          if (tDimIdx >= 0) {
+            const nt = currentT + offset;
+            if (nt >= 0 && nt < maxT) {
+              const c = [...coords]; c[tDimIdx] = nt;
+              const p = prefix + c.join(join);
+              if (!this.cache.has(p)) batch.push(p);
+            }
+          }
+        }
+      }
+      // Flush batch at the end of each distance ring
+      if (batch.length > 0) { batches.push(batch); batch = []; }
+    }
+
+    // Process batches sequentially — each batch awaits before the next starts,
+    // keeping only a few requests in flight at once so display requests aren't
+    // starved. Aborted via the controller when the user scrubs.
+    const signal = controller.signal;
+    (async () => {
+      for (const paths of batches) {
+        if (signal.aborted) return;
+        await Promise.all(
+          paths.map(p => this.getItem(p, { signal }).catch(() => {}))
+        );
+      }
+    })();
+  }
+
+  containsItem(item: string) { return this.inner.containsItem(item); }
+  keys() { return this.inner.keys(); }
+  setItem(item: string, value: any) { return this.inner.setItem(item, value); }
+  deleteItem(item: string) { return this.inner.deleteItem(item); }
 }
 
 function MenuIcon() {
@@ -119,7 +265,178 @@ const COLORMAP_OPTIONS = [
   'blackbody', 'electric', 'portland', 'earth',
 ];
 
+function LayersIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M11.99 18.54l-7.37-5.73L3 14.07l9 7 9-7-1.63-1.27-7.38 5.74zM12 16l7.36-5.73L21 9l-9-7-9 7 1.63 1.27L12 16z" />
+    </svg>
+  );
+}
+
+function ClockIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" />
+    </svg>
+  );
+}
+
+function PlayIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M8 5v14l11-7z" />
+    </svg>
+  );
+}
+
+function PauseIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+    </svg>
+  );
+}
+
+function StepBackIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6z" />
+    </svg>
+  );
+}
+
+function StepForwardIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" />
+    </svg>
+  );
+}
+
+const FPS_OPTIONS = [1, 2, 5, 10, 24];
+
+const DimensionSliderBar = memo(function DimensionSliderBar({ label, current, max, onChange, playing, onPlayingChange, fps, onFpsChange, showSlider, barWidth }: {
+  label: string;
+  current: number;
+  max: number;
+  onChange: (v: number) => void;
+  playing?: boolean;
+  onPlayingChange?: (p: boolean) => void;
+  fps?: number;
+  onFpsChange?: (f: number) => void;
+  showSlider?: boolean;
+  barWidth?: number;
+}) {
+  const showPlayback = !!(onPlayingChange && onFpsChange);
+  const compact = (barWidth ?? 999) < 180;
+
+  const stepBack = () => { onChange(current <= 0 ? max - 1 : current - 1); };
+  const stepForward = () => { onChange((current + 1) % max); };
+
+  const btnStyle: React.CSSProperties = {
+    background: 'none',
+    border: 'none',
+    cursor: 'pointer',
+    padding: compact ? 2 : 4,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    color: 'rgba(255,255,255,0.7)',
+    borderRadius: 4,
+    flexShrink: 0,
+  };
+
+  return (
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
+      gap: compact ? 1 : 4,
+      padding: compact ? '0 3px 0 1px' : '0 8px 0 4px',
+      height: BTN_SIZE,
+      whiteSpace: 'nowrap',
+      flex: 1,
+      minWidth: 0,
+      overflow: 'hidden',
+    }}>
+      <button onClick={stepBack} style={btnStyle} title="Previous">
+        <StepBackIcon />
+      </button>
+
+      {showSlider !== false && (
+        <input
+          type="range"
+          min={0}
+          max={max - 1}
+          value={current}
+          onChange={(e) => { if (playing) onPlayingChange?.(false); onChange(Number(e.target.value)); }}
+          style={{
+            flex: 1,
+            minWidth: 30,
+            height: 4,
+            cursor: 'pointer',
+            accentColor: 'rgba(130,180,255,1)',
+          }}
+        />
+      )}
+
+      <button onClick={stepForward} style={btnStyle} title="Next">
+        <StepForwardIcon />
+      </button>
+
+      {showPlayback && (
+        <>
+          <button
+            onClick={() => onPlayingChange?.(!playing)}
+            style={{ ...btnStyle, color: playing ? 'rgba(130,180,255,1)' : 'rgba(255,255,255,0.7)' }}
+            title={playing ? 'Pause' : 'Play'}
+          >
+            {playing ? <PauseIcon /> : <PlayIcon />}
+          </button>
+          <button
+            onClick={() => {
+              const idx = FPS_OPTIONS.indexOf(fps ?? 5);
+              onFpsChange?.(FPS_OPTIONS[(idx + 1) % FPS_OPTIONS.length]);
+            }}
+            style={{
+              ...btnStyle,
+              fontSize: 9,
+              fontWeight: 700,
+              minWidth: compact ? 28 : 36,
+              color: 'rgba(255,255,255,0.7)',
+              background: 'rgba(255,255,255,0.08)',
+              borderRadius: 8,
+              padding: compact ? '2px 3px' : '2px 6px',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.18)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.08)'; }}
+            title="Frames per second (click to cycle)"
+          >
+            {fps ?? 5} fps
+          </button>
+        </>
+      )}
+
+      <span style={{
+        fontSize: 10,
+        fontWeight: 600,
+        color: 'rgba(255,255,255,0.7)',
+        textAlign: 'center',
+        fontVariantNumeric: 'tabular-nums',
+        flexShrink: 1,
+        overflow: 'hidden',
+        minWidth: 0,
+      }}>
+        {label}: {current + 1}/{max}
+      </span>
+    </div>
+  );
+});
+
+type ToolbarPanel = 'menu' | 'z' | 't' | null;
+
 interface OverlayMenuProps {
+  open: boolean;
+  onToggle: () => void;
   containerW: number;
   containerH: number;
   views: SavedView[];
@@ -142,6 +459,7 @@ interface OverlayMenuProps {
   onTitleVisibleChange: (visible: boolean) => void;
   hasTitle: boolean;
   navigateTo: (dest: { zoom: number; target: [number, number, number] }) => void;
+  onViewSelect: (view: SavedView) => void;
 }
 
 const ELLIPSIS: React.CSSProperties = {
@@ -658,6 +976,7 @@ function useAnnotationHover(
   viewState: any,
   containerW: number,
   containerH: number,
+  sliceFilterRef?: React.RefObject<{ currentZ: number; currentT: number }>,
 ) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
@@ -689,8 +1008,10 @@ function useAnnotationHover(
       let closest: number | null = null;
       let closestDist = Infinity;
 
+      const sf = sliceFilterRef?.current;
       for (let i = 0; i < anns.length; i++) {
         const a = anns[i];
+        if (sf && ((a.z !== undefined && a.z !== sf.currentZ) || (a.t !== undefined && a.t !== sf.currentT))) continue;
         const sx = (a.target[0] - vs.target[0]) * scale + w / 2;
         const sy = (a.target[1] - vs.target[1]) * scale + h / 2 - 9;
         const dx = mx - sx;
@@ -717,13 +1038,15 @@ function useAnnotationHover(
   return hoveredIdx;
 }
 
-const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible, viewState, containerW, containerH, hoveredIdx }: {
+const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible, viewState, containerW, containerH, hoveredIdx, currentZ, currentT }: {
   annotations: Annotation[];
   visible: boolean;
   viewState: any;
   containerW: number;
   containerH: number;
   hoveredIdx: number | null;
+  currentZ: number;
+  currentT: number;
 }) {
   if (!visible || !viewState || annotations.length === 0) return null;
 
@@ -732,6 +1055,7 @@ const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible
   return (
     <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
       {annotations.map((a, i) => {
+        if ((a.z !== undefined && a.z !== currentZ) || (a.t !== undefined && a.t !== currentT)) return null;
         const sx = (a.target[0] - viewState.target[0]) * scale + containerW / 2;
         const sy = (a.target[1] - viewState.target[1]) * scale + containerH / 2;
         const hovered = hoveredIdx === i;
@@ -915,8 +1239,7 @@ const ScaleBarOverlay = memo(function ScaleBarOverlay({ physicalScale, viewState
   );
 });
 
-const OverlayMenu = memo(function OverlayMenu({ containerW, containerH, views, channels, blendMode, colormap, portalTarget, onToggleChannel, onColorChange, onContrastChange, onBlendModeChange, onColormapChange, onApplyAppearance, annotationsVisible, onAnnotationsVisibleChange, scaleBarVisible, onScaleBarVisibleChange, hasScaleBar, titleVisible, onTitleVisibleChange, hasTitle, navigateTo }: OverlayMenuProps) {
-  const [open, setOpen] = useState(false);
+const OverlayMenu = memo(function OverlayMenu({ open, onToggle, containerW, containerH, views, channels, blendMode, colormap, portalTarget, onToggleChannel, onColorChange, onContrastChange, onBlendModeChange, onColormapChange, onApplyAppearance, annotationsVisible, onAnnotationsVisibleChange, scaleBarVisible, onScaleBarVisibleChange, hasScaleBar, titleVisible, onTitleVisibleChange, hasTitle, navigateTo, onViewSelect }: OverlayMenuProps) {
   const [activeTab, setActiveTab] = useState<PanelTab>('views');
 
   const panelW = clamp(containerW - PANEL_MARGIN, PANEL_MIN_W, PANEL_MAX_W);
@@ -926,10 +1249,6 @@ const OverlayMenu = memo(function OverlayMenu({ containerW, containerH, views, c
     <div
       style={{
         ...GLASS,
-        position: 'absolute',
-        top: INSET,
-        left: INSET,
-        zIndex: 10,
         width: open ? panelW : BTN_SIZE,
         height: open ? panelH : BTN_SIZE,
         borderRadius: open ? 12 : BTN_SIZE / 2,
@@ -946,10 +1265,11 @@ const OverlayMenu = memo(function OverlayMenu({ containerW, containerH, views, c
         }}
       >
         <button
-          onClick={() => setOpen((v) => !v)}
+          onClick={onToggle}
           style={{
             width: BTN_SIZE,
             height: BTN_SIZE,
+            marginLeft: 0,
             flexShrink: 0,
             background: 'none',
             border: 'none',
@@ -1023,10 +1343,7 @@ const OverlayMenu = memo(function OverlayMenu({ containerW, containerH, views, c
         }}
       >
         {activeTab === 'views' && views.map((v, i) => (
-          <ViewCard key={i} view={v} onSelect={() => {
-            navigateTo(v);
-            if (v.appearance) onApplyAppearance(v.appearance);
-          }} />
+          <ViewCard key={i} view={v} onSelect={() => onViewSelect(v)} />
         ))}
         {activeTab === 'appearance' && (
           <AppearancePanel
@@ -1042,7 +1359,7 @@ const OverlayMenu = memo(function OverlayMenu({ containerW, containerH, views, c
           />
         )}
         {activeTab === 'info' && (
-          <div>
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
             <button
               onClick={() => onAnnotationsVisibleChange(!annotationsVisible)}
               style={{
@@ -1148,9 +1465,235 @@ const OverlayMenu = memo(function OverlayMenu({ containerW, containerH, views, c
                 </span>
               </button>
             )}
+            <div style={{
+              marginTop: 'auto',
+              paddingTop: 10,
+              borderTop: '1px solid rgba(255,255,255,0.08)',
+              fontSize: 9,
+              color: 'rgba(255,255,255,0.3)',
+              lineHeight: 1.5,
+              textAlign: 'center',
+            }}>
+              <div>microATLAS v{VERSION}</div>
+              <div>Andrew James Brodrick, 2026</div>
+              <a
+                href="https://github.com/LadInTheLab"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: 'rgba(130,180,255,0.5)', textDecoration: 'none' }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = 'rgba(130,180,255,0.8)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(130,180,255,0.5)'; }}
+              >
+                github.com/LadInTheLab
+              </a>
+            </div>
           </div>
         )}
       </div>
+    </div>
+  );
+});
+
+interface ViewerToolbarProps {
+  numZ: number;
+  numT: number;
+  currentZ: number;
+  currentT: number;
+  onZChange: (z: number) => void;
+  onTChange: (t: number) => void;
+  tPlaying: boolean;
+  tFps: number;
+  onTPlayingChange: (p: boolean) => void;
+  onTFpsChange: (f: number) => void;
+  containerW: number;
+  menuProps: Omit<OverlayMenuProps, 'open' | 'onToggle'>;
+}
+
+// Ideal slider bar widths; actual width is clamped to available space
+const SLIDER_BAR_W_IDEAL = 280;
+const SLIDER_BAR_W_PLAYBACK_IDEAL = 360;
+// Slider hidden below this bar width
+const SLIDER_VISIBLE_THRESHOLD = 180;
+const SLIDER_VISIBLE_THRESHOLD_PLAYBACK = 260;
+const GAP = 6;
+
+const ViewerToolbar = memo(function ViewerToolbar({ numZ, numT, currentZ, currentT, onZChange, onTChange, tPlaying, tFps, onTPlayingChange, onTFpsChange, containerW, menuProps }: ViewerToolbarProps) {
+  ensureSpinKeyframes();
+  const [openPanel, setOpenPanel] = useState<ToolbarPanel>(null);
+
+  const toggle = useCallback((panel: 'menu' | 'z' | 't') => {
+    setOpenPanel((prev) => prev === panel ? null : panel);
+  }, []);
+
+  const hasZ = numZ > 1;
+  const hasT = numT > 1;
+
+  // Compute available width for an expanded bar.
+  // Layout: [INSET] [Menu BTN] [gap] [...collapsed before] [THIS bar] [...collapsed after] [INSET]
+  const barAvailW = (panel: 'z' | 't') => {
+    // Menu button is always before
+    let used = INSET * 2 + BTN_SIZE + GAP;
+    if (panel === 'z') {
+      // Z is right after menu; T may be collapsed after
+      if (hasT) used += GAP + BTN_SIZE;
+    } else {
+      // T: Z is collapsed before (between menu and T)
+      if (hasZ) used += GAP + BTN_SIZE;
+    }
+    return containerW - used;
+  };
+
+  const zBarW = openPanel === 'z'
+    ? Math.min(barAvailW('z'), SLIDER_BAR_W_IDEAL)
+    : BTN_SIZE;
+  const tBarW = openPanel === 't'
+    ? Math.min(barAvailW('t'), SLIDER_BAR_W_PLAYBACK_IDEAL)
+    : BTN_SIZE;
+
+  const showZSlider = zBarW >= SLIDER_VISIBLE_THRESHOLD;
+  const showTSlider = tBarW >= SLIDER_VISIBLE_THRESHOLD_PLAYBACK;
+
+  return (
+    <div style={{
+      position: 'absolute',
+      top: INSET,
+      left: INSET,
+      zIndex: 10,
+      display: 'flex',
+      alignItems: 'flex-start',
+      gap: 6,
+    }}>
+      {/* Menu — circle that expands into the full panel */}
+      <OverlayMenu
+        open={openPanel === 'menu'}
+        onToggle={() => toggle('menu')}
+        {...menuProps}
+      />
+
+      {/* Z — circle that expands into a horizontal slider bar */}
+      {hasZ && (
+        <div
+          style={{
+            ...GLASS,
+            width: zBarW,
+            height: BTN_SIZE,
+            borderRadius: BTN_SIZE / 2,
+            overflow: 'hidden',
+            color: 'rgba(255,255,255,0.85)',
+            display: 'flex',
+            alignItems: 'center',
+            transition: TRANSITION,
+            flexShrink: 0,
+          }}
+        >
+          <button
+            onClick={() => toggle('z')}
+            style={{
+              width: BTN_SIZE,
+              height: BTN_SIZE,
+              marginLeft: -1,
+              flexShrink: 0,
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 0,
+              color: 'inherit',
+            }}
+            title={`Z slice: ${currentZ + 1}/${numZ}`}
+          >
+            <LayersIcon />
+          </button>
+          {openPanel === 'z' && (
+            <DimensionSliderBar
+              label="Z"
+              current={currentZ}
+              max={numZ}
+              onChange={onZChange}
+              showSlider={showZSlider}
+              barWidth={zBarW}
+            />
+          )}
+        </div>
+      )}
+
+      {/* T — circle that expands into a horizontal slider bar with playback */}
+      {hasT && (() => {
+        const collapsed = openPanel !== 't';
+        const showRing = tPlaying && collapsed;
+        const RING_PAD = 3;
+        const ringSize = BTN_SIZE + RING_PAD * 2;
+        return (
+          <div style={{ position: 'relative', flexShrink: 0 }}>
+            {/* Spinning glow ring behind the circle during playback */}
+            {showRing && (
+              <div style={{
+                position: 'absolute',
+                top: -RING_PAD,
+                left: -RING_PAD,
+                width: ringSize,
+                height: ringSize,
+                borderRadius: '50%',
+                background: 'conic-gradient(from 0deg, rgba(100,160,255,0.7), rgba(100,160,255,0) 120deg, rgba(100,160,255,0) 240deg, rgba(100,160,255,0.7))',
+                animation: `${SPIN_KEYFRAMES_ID} 1.8s linear infinite`,
+                filter: 'blur(2px)',
+                pointerEvents: 'none',
+              }} />
+            )}
+            <div
+              style={{
+                ...GLASS,
+                position: 'relative',
+                width: tBarW,
+                height: BTN_SIZE,
+                borderRadius: BTN_SIZE / 2,
+                overflow: 'hidden',
+                color: 'rgba(255,255,255,0.85)',
+                display: 'flex',
+                alignItems: 'center',
+                transition: TRANSITION,
+              }}
+            >
+              <button
+                onClick={() => toggle('t')}
+                style={{
+                  width: BTN_SIZE,
+                  height: BTN_SIZE,
+                  marginLeft: -1,
+                  flexShrink: 0,
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 0,
+                  color: 'inherit',
+                }}
+                title={`Time: ${currentT + 1}/${numT}`}
+              >
+                <ClockIcon />
+              </button>
+              {openPanel === 't' && (
+                <DimensionSliderBar
+                  label="T"
+                  current={currentT}
+                  max={numT}
+                  onChange={onTChange}
+                  playing={tPlaying}
+                  onPlayingChange={onTPlayingChange}
+                  fps={tFps}
+                  onFpsChange={onTFpsChange}
+                  showSlider={showTSlider}
+                  barWidth={tBarW}
+                />
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 });
@@ -1170,12 +1713,21 @@ export interface SavedView {
   target: [number, number, number];
   appearance?: SavedViewAppearance;
   default?: boolean;
+  z?: number;
+  t?: number;
+  playback?: {
+    playing?: boolean;
+    fps?: number;
+    startFrame?: number;
+  };
 }
 
 export interface Annotation {
   name: string;
   target: [number, number];
   color?: [number, number, number];
+  z?: number;
+  t?: number;
 }
 
 export type ScaleBarFont = 'Arial' | 'Helvetica' | 'Georgia' | 'Times New Roman' | 'Courier New';
@@ -1393,9 +1945,10 @@ export interface ViewerProps {
   defaultTitleVisible?: boolean;
   onViewStateChange?: (viewState: { zoom: number; target: [number, number, number] }) => void;
   onAppearanceChange?: (appearance: SavedViewAppearance) => void;
+  onSliceChange?: (slice: { z: number; t: number; playing: boolean; fps: number; numZ: number; numT: number }) => void;
 }
 
-export function MicroAtlasViewer({ source, views: externalViews, annotations: externalAnnotations, scaleBar: scaleBarProp, title: titleProp, defaultAnnotationsVisible, defaultScaleBarVisible, defaultTitleVisible, onViewStateChange, onAppearanceChange }: ViewerProps) {
+export function MicroAtlasViewer({ source, views: externalViews, annotations: externalAnnotations, scaleBar: scaleBarProp, title: titleProp, defaultAnnotationsVisible, defaultScaleBarVisible, defaultTitleVisible, onViewStateChange, onAppearanceChange, onSliceChange }: ViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const deckRef = useRef<any>(null);
   // Reuse extension/view instances so deck.gl doesn't diff new refs every render
@@ -1421,11 +1974,21 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   const [blendMode, setBlendMode] = useState<BlendMode>('single');
   const [colormap, setColormap] = useState('viridis');
   const [annotationsVisible, setAnnotationsVisible] = useState(defaultAnnotationsVisible ?? true);
-  const annotationHoveredIdx = useAnnotationHover(containerRef, externalAnnotations ?? [], annotationsVisible, viewState, containerSize.w, containerSize.h);
+  const sliceFilterRef = useRef<{ currentZ: number; currentT: number }>({ currentZ: 0, currentT: 0 });
+  const annotationHoveredIdx = useAnnotationHover(containerRef, externalAnnotations ?? [], annotationsVisible, viewState, containerSize.w, containerSize.h, sliceFilterRef);
   const [scaleBarVisible, setScaleBarVisible] = useState(defaultScaleBarVisible ?? !!scaleBarProp);
   const titleConfig: TitleConfig | null = typeof titleProp === 'string' ? { text: titleProp } : titleProp ?? null;
   const [titleVisible, setTitleVisible] = useState(defaultTitleVisible ?? true);
   const [physicalScale, setPhysicalScale] = useState<PhysicalScale | null>(null);
+  const [currentZ, setCurrentZ] = useState(0);
+  const [currentT, setCurrentT] = useState(0);
+  const [tPlaying, setTPlaying] = useState(false);
+  const [tFps, setTFps] = useState(5);
+  // Keep hover hook's slice filter in sync with current Z/T
+  sliceFilterRef.current = { currentZ, currentT };
+  const onSliceChangeRef = useRef(onSliceChange);
+  onSliceChangeRef.current = onSliceChange;
+  const cachingStoreRef = useRef<CachingStore | null>(null);
   const scaleBarConfig: Required<Pick<ScaleBarConfig, 'maxWidth' | 'position'>> & Pick<ScaleBarConfig, 'fontSize' | 'font' | 'color'> = {
     maxWidth: (typeof scaleBarProp === 'object' ? scaleBarProp.maxWidth : undefined) ?? SCALE_BAR_DEFAULTS.maxWidth,
     position: (typeof scaleBarProp === 'object' ? scaleBarProp.position : undefined) ?? SCALE_BAR_DEFAULTS.position,
@@ -1440,6 +2003,9 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
     data: any[];
     metadata: VivMetadata;
     numChannels: number;
+    numZ: number;
+    numT: number;
+    dimLabels: string[];
     deckDeps: { DeckGL: any; OrthographicView: any };
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1459,6 +2025,11 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   }, [channelsVisible, channelColors, contrastLimitsState, blendMode, colormap]);
 
   useEffect(() => {
+    if (!loaded || !onSliceChangeRef.current) return;
+    onSliceChangeRef.current({ z: currentZ, t: currentT, playing: tPlaying, fps: tFps, numZ: loaded.numZ, numT: loaded.numT });
+  }, [currentZ, currentT, tPlaying, tFps, loaded]);
+
+  useEffect(() => {
     if (!source) return;
     setIsLoading(true);
     setError(null);
@@ -1473,10 +2044,24 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
       .then(([viv, deckReact, deckCore]) =>
         (viv.loadOmeZarr as any)(source, { type: 'multiscales' }).then(
           ({ data, metadata }: { data: any[]; metadata: VivMetadata }) => {
+            // Wrap the zarr store with an in-memory LRU cache so revisiting
+            // Z/T slices (or panning back) is instant instead of re-fetching.
+            const cachingStore = new CachingStore((data[0] as any)._data.store);
+            cachingStoreRef.current = cachingStore;
+            for (const src of data) {
+              (src as any)._data.store = cachingStore;
+              (src as any)._data._chunkStore = cachingStore;
+            }
             const labels: string[] = data[0]?.labels ?? [];
             const cIdx = labels.indexOf('c');
+            const zIdx = labels.indexOf('z');
+            const tIdx = labels.indexOf('t');
             const numChannels = cIdx >= 0 ? data[0].shape[cIdx] : 1;
+            const numZ = zIdx >= 0 ? data[0].shape[zIdx] : 1;
+            const numT = tIdx >= 0 ? data[0].shape[tIdx] : 1;
             const omero = metadata?.omero?.channels ?? [];
+            setCurrentZ(metadata?.omero?.rdefs?.defaultZ ?? 0);
+            setCurrentT(metadata?.omero?.rdefs?.defaultT ?? 0);
             setChannelsVisible(
               Array.from({ length: numChannels }, (_, i) => {
                 const ch = omero[i] as any;
@@ -1500,6 +2085,9 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
               data,
               metadata,
               numChannels,
+              numZ,
+              numT,
+              dimLabels: labels,
               deckDeps: {
                 DeckGL: deckReact.default,
                 OrthographicView: deckCore.OrthographicView,
@@ -1538,6 +2126,11 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
             setViewState(vs);
             onViewStateChangeRef.current?.(vs);
             if (initialView.appearance) handleApplyAppearance(initialView.appearance);
+            if (initialView.z !== undefined) setCurrentZ(initialView.z);
+            if (initialView.t !== undefined) setCurrentT(initialView.t);
+            if (initialView.playback?.startFrame !== undefined) setCurrentT(initialView.playback.startFrame);
+            if (initialView.playback?.fps !== undefined) setTFps(initialView.playback.fps);
+            if (initialView.playback?.playing !== undefined) setTPlaying(initialView.playback.playing);
           } else {
             setViewState(fitVs);
             onViewStateChangeRef.current?.(fitVs);
@@ -1554,25 +2147,68 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   }, [loaded]);
 
   // Per-channel histograms (computed from lowest resolution for speed)
+  // Recomputes when Z or T slice changes so contrast histograms reflect the active slice
   useEffect(() => {
     if (!loaded) return;
-    const { data, numChannels, metadata } = loaded;
-    const defaultT = metadata?.omero?.rdefs?.defaultT ?? 0;
-    const defaultZ = metadata?.omero?.rdefs?.defaultZ ?? 0;
+    const { data, numChannels, dimLabels } = loaded;
     const lowestRes = data[data.length - 1];
     let cancelled = false;
 
     Promise.all(
-      Array.from({ length: numChannels }, (_, c) =>
-        lowestRes.getRaster({ selection: { t: defaultT, z: defaultZ, c } })
-      ),
+      Array.from({ length: numChannels }, (_, c) => {
+        const sel: Record<string, number> = { c };
+        if (dimLabels.includes('z')) sel.z = currentZ;
+        if (dimLabels.includes('t')) sel.t = currentT;
+        return lowestRes.getRaster({ selection: sel });
+      }),
     ).then((rasters: any[]) => {
       if (cancelled) return;
       setHistograms(rasters.map((r: any) => computeHistogram(r.data, HIST_BINS)));
     }).catch(() => { /* histogram is optional, fail silently */ });
 
     return () => { cancelled = true; };
-  }, [loaded]);
+  }, [loaded, currentZ, currentT]);
+
+  // Prefetch adjacent Z/T slices in the background after the current slice loads
+  useEffect(() => {
+    if (!loaded || !cachingStoreRef.current) return;
+    const { dimLabels, numZ, numT, data } = loaded;
+    const zIdx = dimLabels.indexOf('z');
+    const tIdx = dimLabels.indexOf('t');
+    if (zIdx < 0 && tIdx < 0) return;
+    if (numZ <= 1 && numT <= 1) return;
+
+    const dimSep: string = (data[0] as any)._data.meta?.dimension_separator || '.';
+    const numDims = dimLabels.length;
+    const store = cachingStoreRef.current;
+
+    // Cancel any in-flight prefetch immediately so display requests for the
+    // new slice aren't starved by stale prefetch work
+    store.cancelPrefetch();
+
+    // Brief delay so the current slice's tile requests populate the cache
+    // with paths we can derive adjacent-slice paths from
+    const handle = setTimeout(() => {
+      store.prefetchAdjacent({
+        zDimIdx: zIdx, tDimIdx: tIdx,
+        currentZ, currentT,
+        maxZ: numZ, maxT: numT,
+        numDims, dimSep,
+      });
+    }, 100);
+    return () => { clearTimeout(handle); store.cancelPrefetch(); };
+  }, [loaded, currentZ, currentT]);
+
+  // T playback interval — lives at Viewer level so playback works even when
+  // the T panel is closed (e.g. when triggered by a preset view)
+  useEffect(() => {
+    if (!tPlaying || !loaded || loaded.numT <= 1) return;
+    const numT = loaded.numT;
+    const interval = setInterval(() => {
+      setCurrentT(prev => (prev + 1) % numT);
+    }, 1000 / tFps);
+    return () => clearInterval(interval);
+  }, [tPlaying, tFps, loaded]);
 
   const handleToggleChannel = useCallback((index: number) => {
     setChannelsVisible((prev) => {
@@ -1605,6 +2241,17 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
     if (a.blendMode) setBlendMode(a.blendMode);
     if (a.colormap) setColormap(a.colormap);
   }, []);
+
+  const handleViewSelect = useCallback((v: SavedView) => {
+    navigateTo(v);
+    if (v.appearance) handleApplyAppearance(v.appearance);
+    if (v.z !== undefined) setCurrentZ(v.z);
+    if (v.t !== undefined) setCurrentT(v.t);
+    if (v.playback?.startFrame !== undefined) setCurrentT(v.playback.startFrame);
+    if (v.playback?.fps !== undefined) setTFps(v.playback.fps);
+    // Set playing last so the interval picks up the correct fps/startFrame
+    if (v.playback?.playing !== undefined) setTPlaying(v.playback.playing);
+  }, [navigateTo, handleApplyAppearance]);
 
   const channelInfos = useMemo<ChannelInfo[]>(() => {
     if (!loaded) return [];
@@ -1644,13 +2291,11 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   // Memoize layer so it's only rebuilt when visual props change, not on every viewState tick
   const imageLayer = useMemo(() => {
     if (!loaded) return null;
-    const { viv, data, metadata, numChannels, deckDeps } = loaded;
+    const { viv, data, metadata, numChannels, dimLabels, deckDeps } = loaded;
     const { OrthographicView } = deckDeps;
     const { MultiscaleImageLayer, ImageLayer, ColorPaletteExtension, AdditiveColormapExtension } = viv as any;
 
     const omeroChannels = metadata?.omero?.channels ?? [];
-    const defaultT = metadata?.omero?.rdefs?.defaultT ?? 0;
-    const defaultZ = metadata?.omero?.rdefs?.defaultZ ?? 0;
 
     const defaultContrastLimits: [number, number][] = Array.from({ length: numChannels }, (_, i) => {
       const ch = omeroChannels[i];
@@ -1670,9 +2315,12 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
       ? channelsVisible
       : Array.from({ length: numChannels }, () => true);
 
-    const selections = Array.from({ length: numChannels }, (_, c) => ({
-      t: defaultT, z: defaultZ, c,
-    }));
+    const selections = Array.from({ length: numChannels }, (_, c) => {
+      const sel: Record<string, number> = { c };
+      if (dimLabels.includes('z')) sel.z = currentZ;
+      if (dimLabels.includes('t')) sel.t = currentT;
+      return sel;
+    });
 
     const loader = data.length > 1 ? data : data[0];
     const Layer = data.length > 1 ? MultiscaleImageLayer : ImageLayer;
@@ -1699,7 +2347,7 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
       ...(isAdditive ? { colormap } : {}),
       id: 'microatlas-image',
     });
-  }, [loaded, contrastLimitsState, channelColors, channelsVisible, blendMode, colormap]);
+  }, [loaded, contrastLimitsState, channelColors, channelsVisible, blendMode, colormap, currentZ, currentT]);
 
   const renderContent = () => {
     if (isLoading) {
@@ -1736,6 +2384,8 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
         <AnnotationOverlay
           annotations={externalAnnotations ?? []}
           visible={annotationsVisible}
+          currentZ={currentZ}
+          currentT={currentT}
           viewState={viewState}
           containerW={containerSize.w}
           containerH={containerSize.h}
@@ -1763,29 +2413,43 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
     <div ref={containerRef} style={{ position: 'absolute', inset: 0 }}>
       {renderContent()}
       {loaded && (
-        <OverlayMenu
+        <ViewerToolbar
+          numZ={loaded.numZ}
+          numT={loaded.numT}
+          currentZ={currentZ}
+          currentT={currentT}
+          onZChange={setCurrentZ}
+          onTChange={setCurrentT}
+          tPlaying={tPlaying}
+          tFps={tFps}
+          onTPlayingChange={setTPlaying}
+          onTFpsChange={setTFps}
           containerW={containerSize.w}
-          containerH={containerSize.h}
-          views={menuViews}
-          channels={channelInfos}
-          blendMode={blendMode}
-          colormap={colormap}
-          portalTarget={containerRef.current}
-          onToggleChannel={handleToggleChannel}
-          onColorChange={handleColorChange}
-          onContrastChange={handleContrastChange}
-          onBlendModeChange={setBlendMode}
-          onColormapChange={setColormap}
-          onApplyAppearance={handleApplyAppearance}
-          annotationsVisible={annotationsVisible}
-          onAnnotationsVisibleChange={setAnnotationsVisible}
-          scaleBarVisible={scaleBarVisible}
-          onScaleBarVisibleChange={setScaleBarVisible}
-          hasScaleBar={!!physicalScale && !!scaleBarProp}
-          titleVisible={titleVisible}
-          onTitleVisibleChange={setTitleVisible}
-          hasTitle={!!titleConfig}
-          navigateTo={navigateTo}
+          menuProps={{
+            containerW: containerSize.w,
+            containerH: containerSize.h,
+            views: menuViews,
+            channels: channelInfos,
+            blendMode,
+            colormap,
+            portalTarget: containerRef.current,
+            onToggleChannel: handleToggleChannel,
+            onColorChange: handleColorChange,
+            onContrastChange: handleContrastChange,
+            onBlendModeChange: setBlendMode,
+            onColormapChange: setColormap,
+            onApplyAppearance: handleApplyAppearance,
+            annotationsVisible,
+            onAnnotationsVisibleChange: setAnnotationsVisible,
+            scaleBarVisible,
+            onScaleBarVisibleChange: setScaleBarVisible,
+            hasScaleBar: !!physicalScale && !!scaleBarProp,
+            titleVisible,
+            onTitleVisibleChange: setTitleVisible,
+            hasTitle: !!titleConfig,
+            navigateTo,
+            onViewSelect: handleViewSelect,
+          }}
         />
       )}
     </div>
