@@ -33,7 +33,7 @@ const GLASS: React.CSSProperties = {
   WebkitBackdropFilter: 'blur(16px)',
 };
 
-const VERSION = '1.4.2';
+const VERSION = '1.4.3';
 
 const BTN_SIZE = 28;
 const INSET = 6;
@@ -1001,17 +1001,45 @@ function AppearancePanel({ channels, blendMode, colormap, onToggleChannel, onCol
   );
 }
 
-function PlaceIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z" />
-    </svg>
-  );
-}
-
-const ANNOTATION_MAX_W = 120;
 const ANNOTATION_HIT_RADIUS = 16;
+const ANNOTATION_PIN_H = 18;
+const ANNOTATION_PIN_W = 12;
+const ANNOTATION_LABEL_MAX_W = 120;
 const DEFAULT_ANNOTATION_COLOR: [number, number, number] = [255, 100, 100];
+
+/** Draw a map-pin shape onto a 2D canvas context at (cx, cy) pointing down.
+ *  The pin tip is at (cx, cy); the body extends upward. */
+function drawPin(ctx: CanvasRenderingContext2D, cx: number, cy: number, color: string, scale: number) {
+  const w = ANNOTATION_PIN_W * scale;
+  const h = ANNOTATION_PIN_H * scale;
+  const r = w / 2;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  // Shadow
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.shadowBlur = 3 * scale;
+  ctx.shadowOffsetY = 1 * scale;
+
+  // Pin body: a circle-topped teardrop shape
+  ctx.beginPath();
+  ctx.moveTo(0, 0); // tip
+  ctx.bezierCurveTo(-w * 0.4, -h * 0.4, -r, -h * 0.55, -r, -h + r);
+  ctx.arc(0, -h + r, r, Math.PI, 0, false);
+  ctx.bezierCurveTo(r, -h * 0.55, w * 0.4, -h * 0.4, 0, 0);
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  // Inner dot
+  ctx.shadowColor = 'transparent';
+  ctx.beginPath();
+  ctx.arc(0, -h + r, r * 0.45, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fill();
+
+  ctx.restore();
+}
 
 function useAnnotationHover(
   containerRef: React.RefObject<HTMLElement | null>,
@@ -1023,6 +1051,7 @@ function useAnnotationHover(
   sliceFilterRef?: React.RefObject<{ currentZ: number; currentT: number }>,
 ) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  const [pressedIdx, setPressedIdx] = useState<number | null>(null);
 
   const viewStateRef = useRef(viewState);
   const annotationsRef = useRef(annotations);
@@ -1035,14 +1064,15 @@ function useAnnotationHover(
     const el = containerRef.current;
     if (!el || !visible) {
       setHoveredIdx(null);
+      setPressedIdx(null);
       return;
     }
 
-    const onMove = (e: MouseEvent) => {
+    const hitTest = (e: MouseEvent): number | null => {
       const vs = viewStateRef.current;
       const anns = annotationsRef.current;
       const { w, h } = sizeRef.current;
-      if (!vs || anns.length === 0) { setHoveredIdx(null); return; }
+      if (!vs || anns.length === 0) return null;
 
       const rect = el.getBoundingClientRect();
       const mx = e.clientX - rect.left;
@@ -1057,98 +1087,172 @@ function useAnnotationHover(
         const a = anns[i];
         if (sf && ((a.z !== undefined && a.z !== sf.currentZ) || (a.t !== undefined && a.t !== sf.currentT))) continue;
         const sx = (a.target[0] - vs.target[0]) * scale + w / 2;
-        const sy = (a.target[1] - vs.target[1]) * scale + h / 2 - 9;
+        const sy = (a.target[1] - vs.target[1]) * scale + h / 2;
+        if (sx < -ANNOTATION_HIT_RADIUS || sx > w + ANNOTATION_HIT_RADIUS ||
+            sy < -ANNOTATION_PIN_H - ANNOTATION_HIT_RADIUS || sy > h + ANNOTATION_HIT_RADIUS) continue;
         const dx = mx - sx;
-        const dy = my - sy;
+        const dy = my - (sy - ANNOTATION_PIN_H / 2);
         const dist = Math.sqrt(dx * dx + dy * dy);
         if (dist < ANNOTATION_HIT_RADIUS && dist < closestDist) {
           closest = i;
           closestDist = dist;
         }
       }
-      setHoveredIdx(closest);
+      return closest;
     };
 
-    const onLeave = () => setHoveredIdx(null);
+    const onMove = (e: MouseEvent) => setHoveredIdx(hitTest(e));
+    const onLeave = () => { setHoveredIdx(null); setPressedIdx(null); };
+    const onDown = (e: MouseEvent) => {
+      const idx = hitTest(e);
+      if (idx !== null) setPressedIdx(idx);
+    };
+    const onUp = () => setPressedIdx(null);
 
     el.addEventListener('mousemove', onMove);
     el.addEventListener('mouseleave', onLeave);
+    el.addEventListener('mousedown', onDown);
+    window.addEventListener('mouseup', onUp);
     return () => {
       el.removeEventListener('mousemove', onMove);
       el.removeEventListener('mouseleave', onLeave);
+      el.removeEventListener('mousedown', onDown);
+      window.removeEventListener('mouseup', onUp);
     };
   }, [containerRef, visible]);
 
-  return hoveredIdx;
+  return { hoveredIdx, pressedIdx };
 }
 
-const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible, viewState, containerW, containerH, hoveredIdx, currentZ, currentT }: {
+/** Canvas-based annotation overlay — draws all markers in a single pass
+ *  instead of creating a DOM node per annotation. Handles hundreds of
+ *  annotations at 60fps with viewport culling. */
+const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible, viewState, containerW, containerH, hoveredIdx, pressedIdx, currentZ, currentT }: {
   annotations: Annotation[];
   visible: boolean;
   viewState: any;
   containerW: number;
   containerH: number;
   hoveredIdx: number | null;
+  pressedIdx: number | null;
   currentZ: number;
   currentT: number;
 }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !visible || !viewState || annotations.length === 0) {
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const cw = containerW;
+    const ch = containerH;
+
+    // Resize canvas backing store to match CSS size × device pixel ratio
+    if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+      canvas.width = cw * dpr;
+      canvas.height = ch * dpr;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+
+    const scale = Math.pow(2, viewState.zoom);
+    const margin = ANNOTATION_PIN_H + 30; // pin height + label headroom
+
+    // Draw non-hovered markers first, then hovered on top
+    let hoveredAnnotation: { a: Annotation; sx: number; sy: number } | null = null;
+
+    for (let i = 0; i < annotations.length; i++) {
+      const a = annotations[i];
+      if ((a.z !== undefined && a.z !== currentZ) || (a.t !== undefined && a.t !== currentT)) continue;
+
+      const sx = (a.target[0] - viewState.target[0]) * scale + cw / 2;
+      const sy = (a.target[1] - viewState.target[1]) * scale + ch / 2;
+
+      // Viewport culling
+      if (sx < -margin || sx > cw + margin || sy < -margin || sy > ch + margin) continue;
+
+      if (i === hoveredIdx) {
+        hoveredAnnotation = { a, sx, sy };
+        continue; // draw last so it's on top
+      }
+
+      const color = a.color ?? DEFAULT_ANNOTATION_COLOR;
+      drawPin(ctx, sx, sy, rgbStr(color), 1);
+    }
+
+    // Draw hovered marker larger + with label
+    if (hoveredAnnotation) {
+      const { a, sx, sy } = hoveredAnnotation;
+      const color = a.color ?? DEFAULT_ANNOTATION_COLOR;
+      drawPin(ctx, sx, sy, rgbStr(color), 1.2);
+
+      // Label tooltip above the pin
+      const isPressed = pressedIdx === hoveredIdx && pressedIdx !== null;
+      ctx.font = '500 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+      let label = a.name;
+      const maxLabelW = isPressed ? cw - 24 : ANNOTATION_LABEL_MAX_W; // full width minus margin when pressed
+      const ellipsis = '\u2026';
+      if (ctx.measureText(label).width > maxLabelW) {
+        while (label.length > 1 && ctx.measureText(label + ellipsis).width > maxLabelW) {
+          label = label.slice(0, -1);
+        }
+        label = label.trimEnd() + ellipsis;
+      }
+      const textW = ctx.measureText(label).width;
+      const padX = 8;
+      const padY = 3;
+      const boxW = textW + padX * 2;
+      const boxH = 16 + padY * 2;
+      // Clamp horizontally so the box stays within the container
+      let boxX = sx - boxW / 2;
+      if (boxX < 4) boxX = 4;
+      if (boxX + boxW > cw - 4) boxX = cw - 4 - boxW;
+      const boxY = sy - ANNOTATION_PIN_H * 1.2 - boxH - 2;
+      const textCenterX = boxX + boxW / 2;
+
+      // Background pill
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,0,0,0.4)';
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      const r = 6;
+      ctx.roundRect(boxX, boxY, boxW, boxH, r);
+      ctx.fillStyle = 'rgba(20,20,20,0.85)';
+      ctx.fill();
+      ctx.restore();
+
+      // Label text
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, textCenterX, boxY + boxH / 2);
+    }
+  }, [annotations, visible, viewState, containerW, containerH, hoveredIdx, pressedIdx, currentZ, currentT]);
+
   if (!visible || !viewState || annotations.length === 0) return null;
 
-  const scale = Math.pow(2, viewState.zoom);
-
   return (
-    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
-      {annotations.map((a, i) => {
-        if ((a.z !== undefined && a.z !== currentZ) || (a.t !== undefined && a.t !== currentT)) return null;
-        const sx = (a.target[0] - viewState.target[0]) * scale + containerW / 2;
-        const sy = (a.target[1] - viewState.target[1]) * scale + containerH / 2;
-        const hovered = hoveredIdx === i;
-        const color = a.color ?? DEFAULT_ANNOTATION_COLOR;
-        const colorStr = rgbStr(color);
-
-        return (
-          <div
-            key={i}
-            style={{
-              position: 'absolute',
-              left: sx,
-              top: sy,
-              transform: 'translate(-50%, -100%)',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-            }}
-          >
-            <div style={{
-              ...GLASS,
-              background: 'rgba(20,20,20,0.75)',
-              borderRadius: 6,
-              padding: '3px 8px',
-              marginBottom: 2,
-              maxWidth: ANNOTATION_MAX_W,
-              ...ELLIPSIS,
-              fontSize: 10,
-              fontWeight: 500,
-              color: 'rgba(255,255,255,0.9)',
-              lineHeight: '16px',
-              opacity: hovered ? 1 : 0,
-              transform: hovered ? 'translateY(0)' : 'translateY(4px)',
-              transition: 'opacity 0.15s, transform 0.15s',
-            }}>
-              {a.name}
-            </div>
-            <div style={{
-              color: colorStr,
-              filter: 'drop-shadow(0 1px 3px rgba(0,0,0,0.5))',
-              transition: 'transform 0.15s',
-              transform: hovered ? 'scale(1.2)' : 'scale(1)',
-            }}>
-              <PlaceIcon />
-            </div>
-          </div>
-        );
-      })}
-    </div>
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: 'absolute',
+        inset: 0,
+        width: containerW,
+        height: containerH,
+        pointerEvents: 'none',
+      }}
+    />
   );
 });
 
@@ -2023,7 +2127,7 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
   const [colormap, setColormap] = useState('viridis');
   const [annotationsVisible, setAnnotationsVisible] = useState(defaultAnnotationsVisible ?? true);
   const sliceFilterRef = useRef<{ currentZ: number; currentT: number }>({ currentZ: 0, currentT: 0 });
-  const annotationHoveredIdx = useAnnotationHover(containerRef, externalAnnotations ?? [], annotationsVisible, viewState, containerSize.w, containerSize.h, sliceFilterRef);
+  const { hoveredIdx: annotationHoveredIdx, pressedIdx: annotationPressedIdx } = useAnnotationHover(containerRef, externalAnnotations ?? [], annotationsVisible, viewState, containerSize.w, containerSize.h, sliceFilterRef);
   const [scaleBarVisible, setScaleBarVisible] = useState(defaultScaleBarVisible ?? !!scaleBarProp);
   const titleConfig: TitleConfig | null = typeof titleProp === 'string' ? { text: titleProp } : titleProp ?? null;
   const [titleVisible, setTitleVisible] = useState(defaultTitleVisible ?? true);
@@ -2469,6 +2573,7 @@ export function MicroAtlasViewer({ source, views: externalViews, annotations: ex
           containerW={containerSize.w}
           containerH={containerSize.h}
           hoveredIdx={annotationHoveredIdx}
+          pressedIdx={annotationPressedIdx}
         />
         {physicalScale && scaleBarProp && (
           <ScaleBarOverlay
