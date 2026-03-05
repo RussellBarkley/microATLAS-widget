@@ -33,7 +33,7 @@ const GLASS: React.CSSProperties = {
   WebkitBackdropFilter: 'blur(16px)',
 };
 
-const VERSION = '1.4.3';
+const VERSION = '1.4.4';
 
 const BTN_SIZE = 28;
 const INSET = 6;
@@ -1169,7 +1169,8 @@ const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible
     const scale = Math.pow(2, viewState.zoom);
     const margin = ANNOTATION_PIN_H + 30; // pin height + label headroom
 
-    // Draw non-hovered markers first, then hovered on top
+    // First pass: collect visible annotations and count them
+    const visibleMarkers: { a: Annotation; sx: number; sy: number; i: number }[] = [];
     let hoveredAnnotation: { a: Annotation; sx: number; sy: number } | null = null;
 
     for (let i = 0; i < annotations.length; i++) {
@@ -1184,11 +1185,39 @@ const AnnotationOverlay = memo(function AnnotationOverlay({ annotations, visible
 
       if (i === hoveredIdx) {
         hoveredAnnotation = { a, sx, sy };
-        continue; // draw last so it's on top
+        continue;
       }
 
-      const color = a.color ?? DEFAULT_ANNOTATION_COLOR;
-      drawPin(ctx, sx, sy, rgbStr(color), 1);
+      visibleMarkers.push({ a, sx, sy, i });
+    }
+
+    // LOD: use simple dots when many annotations are on screen
+    const LOD_THRESHOLD = 50;
+    const useSimple = visibleMarkers.length > LOD_THRESHOLD;
+
+    if (useSimple) {
+      // Batch all dots by color to minimize state changes
+      const byColor = new Map<string, { sx: number; sy: number }[]>();
+      for (const m of visibleMarkers) {
+        const c = rgbStr(m.a.color ?? DEFAULT_ANNOTATION_COLOR);
+        let arr = byColor.get(c);
+        if (!arr) { arr = []; byColor.set(c, arr); }
+        arr.push(m);
+      }
+      const dotR = 4;
+      for (const [color, points] of byColor) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        for (const p of points) {
+          ctx.moveTo(p.sx + dotR, p.sy);
+          ctx.arc(p.sx, p.sy, dotR, 0, Math.PI * 2);
+        }
+        ctx.fill();
+      }
+    } else {
+      for (const m of visibleMarkers) {
+        drawPin(ctx, m.sx, m.sy, rgbStr(m.a.color ?? DEFAULT_ANNOTATION_COLOR), 1);
+      }
     }
 
     // Draw hovered marker larger + with label
