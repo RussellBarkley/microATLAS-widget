@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { MicroAtlasViewer, SavedView, SavedViewAppearance, Annotation, ScaleBarConfig, ScaleBarFont, TitleConfig, TitleFont } from '../src';
 
 const WIDGET_URL = 'https://LadInTheLab.github.io/microATLAS-widget/widget.js';
-const DEFAULT_SOURCE = 'https://barkley-replication.s3.us-east-2.amazonaws.com/experiment1/sample1.zarr/';
+const DEFAULT_SOURCE = 'https://nyu1.osn.mghpcc.org/barkley-replication/calreticulin_antibody/primary_secondary.zarr/';
 
 const COLOR_SWATCHES: [number, number, number][] = [
   [235, 87, 87], [99, 179, 237], [104, 211, 145],
